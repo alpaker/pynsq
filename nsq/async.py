@@ -360,6 +360,10 @@ class AsyncConn(event.EventedMixin):
         self.rdy = value
         return True
 
+    @property
+    def possible_in_flight(self):
+        return max(self.rdy, self.in_flight)
+    
     def _on_connect(self, **kwargs):
         identify_data = {
             'short_id': self.short_hostname, # TODO remove when deprecating pre 1.0 support
@@ -486,7 +490,6 @@ class AsyncConn(event.EventedMixin):
         frame, data = protocol.unpack_response(data)
         if frame == protocol.FRAME_TYPE_MESSAGE:
             self.last_msg_timestamp = time.time()
-            self.rdy = max(self.rdy - 1, 0)
             self.in_flight += 1
 
             message = protocol.decode_message(data)

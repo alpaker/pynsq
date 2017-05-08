@@ -199,7 +199,6 @@ class Reader(Client):
         self.max_tries = max_tries
         self.max_in_flight = max_in_flight
         self.low_rdy_idle_timeout = low_rdy_idle_timeout
-        self.total_rdy = 0
         self.need_rdy_redistributed = False
         self.lookupd_poll_interval = lookupd_poll_interval
         self.lookupd_poll_jitter = lookupd_poll_jitter
@@ -316,23 +315,12 @@ class Reader(Client):
         except Exception:
             logger.exception('[%s:%s] failed to handle_message() %r', conn.id, self.name, message)
 
+    @property
+    def total_possible_in_flight(self):
+        return sum(c.possible_in_flight for c in self.conns.values())
+            
     def _handle_message(self, conn, message):
-        self.total_rdy = max(self.total_rdy - 1, 0)
-
-        rdy_conn = conn
-        if len(self.conns) > self.max_in_flight and time.time() - self.random_rdy_ts > 30:
-            # if all connections aren't getting RDY
-            # occsionally randomize which connection gets RDY
-            self.random_rdy_ts = time.time()
-            conns_with_no_rdy = [c for c in itervalues(self.conns) if not c.rdy]
-            if conns_with_no_rdy:
-                rdy_conn = random.choice(conns_with_no_rdy)
-                if rdy_conn is not conn:
-                    logger.info('[%s:%s] redistributing RDY to %s',
-                                conn.id, self.name, rdy_conn.id)
-
-        self._maybe_update_rdy(rdy_conn)
-
+        self._maybe_update_rdy(conn)
         success = False
         try:
             if 0 < self.max_tries < message.attempts:
@@ -358,7 +346,7 @@ class Reader(Client):
         if self.backoff_timer.get_interval() or self.max_in_flight == 0:
             return
 
-        if conn.rdy <= 1 or conn.rdy < int(conn.last_rdy * 0.25):
+        if conn.rdy <= 1:
             self._send_rdy(conn, self._connection_max_in_flight())
 
     def _finish_backoff_block(self):
@@ -452,9 +440,7 @@ class Reader(Client):
         if value > conn.max_rdy_count:
             value = conn.max_rdy_count
 
-        total_possible_other = sum(
-            max(c.last_rdy, c.in_flight) for c in self.conns.values() if c is not conn
-        )
+        total_possible_other = self.total_possible_in_flight - conn.possible_in_flight
         if (total_possible_other + value) > self.max_in_flight:
             if not conn.rdy:
                 # if we're going from RDY 0 to non-0 and we couldn't because
@@ -463,9 +449,7 @@ class Reader(Client):
                 conn.rdy_timeout = self.io_loop.add_timeout(time.time() + 5, rdy_retry_callback)
             return
 
-        new_rdy = max(self.total_rdy - conn.rdy + value, 0)
-        if conn.send_rdy(value):
-            self.total_rdy = new_rdy
+        conn.send_rdy(value)
 
     def connect_to_nsqd(self, host, port):
         """
@@ -538,8 +522,6 @@ class Reader(Client):
     def _on_connection_close(self, conn, **kwargs):
         if conn.id in self.conns:
             del self.conns[conn.id]
-
-        self.total_rdy = max(self.total_rdy - conn.rdy, 0)
 
         logger.warning('[%s:%s] connection closed', conn.id, self.name)
 
@@ -622,7 +604,6 @@ class Reader(Client):
                 if conn.rdy > 0:
                     logger.debug('[%s:%s] rdy: %d -> 0', conn.id, self.name, conn.rdy)
                     self._send_rdy(conn, 0)
-            self.total_rdy = 0
         else:
             self.need_rdy_redistributed = True
             self._redistribute_rdy_state()
@@ -659,20 +640,10 @@ class Reader(Client):
         if self.need_rdy_redistributed:
             self.need_rdy_redistributed = False
 
-            # first set RDY 0 to all connections that have not received a message within
-            # a configurable timeframe (low_rdy_idle_timeout).
-            for conn_id, conn in iteritems(self.conns):
-                last_message_duration = time.time() - conn.last_msg_timestamp
-                logger.debug('[%s:%s] rdy: %d (last message received %.02fs)',
-                             conn.id, self.name, conn.rdy, last_message_duration)
-                if conn.rdy > 0 and last_message_duration > self.low_rdy_idle_timeout:
-                    logger.info('[%s:%s] idle connection, giving up RDY count', conn.id, self.name)
-                    self._send_rdy(conn, 0)
-
             if backoff_interval:
-                max_in_flight = 1 - self.total_rdy
+                max_in_flight = 1
             else:
-                max_in_flight = self.max_in_flight - self.total_rdy
+                max_in_flight = self.max_in_flight
 
             # randomly walk the list of possible connections and send RDY 1 (up to our
             # calculate "max_in_flight").  We only need to send RDY 1 because in both
@@ -682,9 +653,14 @@ class Reader(Client):
             # because it would be overly complicated and not actually worth it (ie. given enough
             # redistribution rounds it doesn't matter).
             possible_conns = list(self.conns.values())
+            winners = []
             while possible_conns and max_in_flight:
                 max_in_flight -= 1
                 conn = possible_conns.pop(random.randrange(len(possible_conns)))
+                winners.append(conn)
+            for conn in possible_conns:
+                self._send_rdy(conn, 0)
+            for conn in winners:
                 logger.info('[%s:%s] redistributing RDY', conn.id, self.name)
                 self._send_rdy(conn, 1)
 
