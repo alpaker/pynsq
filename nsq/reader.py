@@ -452,7 +452,10 @@ class Reader(Client):
         if value > conn.max_rdy_count:
             value = conn.max_rdy_count
 
-        if (self.total_rdy + value) > self.max_in_flight:
+        total_possible_other = sum(
+            max(c.last_rdy, c.in_flight) for c in self.conns.values() if c is not conn
+        )
+        if (total_possible_other + value) > self.max_in_flight:
             if not conn.rdy:
                 # if we're going from RDY 0 to non-0 and we couldn't because
                 # of the configured max in flight, try again
