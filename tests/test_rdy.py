@@ -125,7 +125,8 @@ def test_rdy_disable_enable_in_backoff(ioloop_current_mock):
 @patch("random.randrange")
 @patch("tornado.ioloop.IOLoop.current")
 def test_rdy_retry(ioloop_current_mock, randrange_mock):
-    ioloop_current_mock.return_value = get_ioloop()
+    ioloop_mock = get_ioloop()
+    ioloop_current_mock.return_value = ioloop_mock
     randrange_mock.return_value = 0
     r = get_reader(max_in_flight=1)
     get_conn(r)
